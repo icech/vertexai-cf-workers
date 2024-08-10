@@ -49,9 +49,19 @@ async function handleRequest(request) {
         return createErrorResponse(405, "invalid_request_error", "GET method is not allowed");
     }
 
-    const apiKey = request.headers.get("x-api-key");
+    let apiKey;
+    const url = new URL(request.url);
+    const normalizedPathname = url.pathname.replace(/^(\/)+/, '/');
+
+    const authHeader = request.headers.get('Authorization');
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        apiKey = authHeader.split('Bearer ')[1].trim();
+    } else {
+        apiKey = request.headers.get("x-api-key");
+    }
+
     if (!API_KEY || API_KEY !== apiKey) {
-        return createErrorResponse(401, "authentication_error", "invalid x-api-key");
+        return createErrorResponse(401, "authentication_error", "Invalid API key");
     }
 
     const signedJWT = await createSignedJWT(CLIENT_EMAIL, PRIVATE_KEY)
@@ -62,13 +72,12 @@ async function handleRequest(request) {
     }
 
     try {
-        const url = new URL(request.url);
-        const normalizedPathname = url.pathname.replace(/^(\/)+/, '/');
         switch(normalizedPathname) {
-            case "/v1/v1/messages":
             case "/v1/messages":
             case "/messages":
-                return handleMessagesEndpoint(request, token);
+                return handleClaudeMessagesEndpoint(request, token);
+            case "/v1/chat/completions":
+                return handleChatGPTEndpoint(request, token);
             default:
                 return createErrorResponse(404, "not_found_error", "Not Found");
         }
@@ -77,8 +86,8 @@ async function handleRequest(request) {
         return createErrorResponse(500, "api_error", "An unexpected error occurred");
     }
 }
- 
-async function handleMessagesEndpoint(request, api_token) {
+
+async function handleClaudeMessagesEndpoint(request, api_token) {
     const anthropicVersion = request.headers.get('anthropic-version');
     if (anthropicVersion && anthropicVersion !== '2023-06-01') {
         return createErrorResponse(400, "invalid_request_error", "API version not supported");
@@ -163,6 +172,227 @@ async function handleMessagesEndpoint(request, api_token) {
         }
     }
 }
+
+async function handleChatGPTEndpoint(request, api_token) {
+    let payload;
+    try {
+        payload = await request.json();
+    } catch (err) {
+        console.error("Error parsing request body:", err);
+        return createErrorResponse(400, "invalid_request_error", "The request body is not valid JSON.");
+    }
+
+    let systemMessage = '';
+    if (payload.messages && payload.messages.length > 0 && payload.messages[0].role === 'system') {
+        systemMessage = payload.messages.shift().content;
+    }
+
+    const claudePayload = transformChatGPTToClaude(payload, systemMessage);
+
+    // Use claude-3-5-sonnet@20240620 model
+    // const model = MODELS["claude-3-5-sonnet-20240620"];
+    const model = MODELS["claude-3-haiku-20240307"];
+    const url = `https://${model.region}-aiplatform.googleapis.com/v1/projects/${PROJECT}/locations/${model.region}/publishers/anthropic/models/${model.vertexName}:streamRawPredict`;
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${api_token}`
+            },
+            body: JSON.stringify(claudePayload)
+        });
+
+        if (!response.ok) {
+            const errorData = await response.text();
+            console.error("Claude API error. Status:", response.status, "Response:", errorData);
+            return createErrorResponse(response.status, "api_error", "An error occurred while processing the request");
+        }
+
+        if (claudePayload.stream) {
+            const { readable, writable } = new TransformStream();
+            const writer = writable.getWriter();
+            const encoder = new TextEncoder();
+
+            (async () => {
+                const reader = response.body.getReader();
+                let buffer = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += new TextDecoder().decode(value);
+                    const events = buffer.split('\n\n');
+                    buffer = events.pop();
+                    for (const event of events) {
+                        if (event.trim() === '') continue;
+                        const parsedEvent = parseSSEEvent(event);
+                        if (parsedEvent) {
+                            await writer.write(encoder.encode(`data: ${JSON.stringify(parsedEvent)}\n\n`));
+                        }
+                    }
+                }
+                await writer.write(encoder.encode(`data: [DONE]\n\n`));
+                await writer.close();
+            })();
+
+            return new Response(readable, {
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'Access-Control-Allow-Origin': '*',
+                }
+            });
+        } else {
+            const data = await response.json();
+            const chatGPTResponse = transformClaudeToChatGPT(data, payload);
+            return new Response(JSON.stringify(chatGPTResponse), {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                }
+            });
+        }
+    } catch (error) {
+        console.error("Error in handleChatGPTEndpoint:", error);
+        return createErrorResponse(500, "api_error", "An unexpected error occurred");
+    }
+}
+
+function parseSSEEvent(event) {
+    const lines = event.split('\n');
+    const data = lines.find(line => line.startsWith('data: '));
+    if (data) {
+        try {
+            const parsed = JSON.parse(data.slice(6));
+            if (parsed.type === 'content_block_delta') {
+                return {
+                    id: 'chatcmpl-' + Math.random().toString(36).substr(2, 9),
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: 'gpt-3.5-turbo-0613',
+                    choices: [{
+                        index: 0,
+                        delta: { content: parsed.delta.text },
+                        finish_reason: null
+                    }]
+                };
+            } else if (parsed.type === 'message_delta' && parsed.delta.stop_reason) {
+                return {
+                    id: 'chatcmpl-' + Math.random().toString(36).substr(2, 9),
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: 'gpt-3.5-turbo-0613',
+                    choices: [{
+                        index: 0,
+                        delta: {},
+                        finish_reason: parsed.delta.stop_reason
+                    }]
+                };
+            }
+        } catch (e) {
+            console.error('Error parsing SSE event:', e);
+        }
+    }
+    return null;
+}
+
+function transformChatGPTToClaude(chatGPTPayload, systemMessage = '') {
+    let claudeMessages = [];
+    let lastRole = null;
+
+    for (let msg of chatGPTPayload.messages) {
+        let role = msg.role === 'assistant' ? 'assistant' : 'user';
+        let content = msg.content;
+
+        if (msg.role === 'system') {
+            if (claudeMessages.length === 0) {
+                claudeMessages.push({
+                    role: 'user',
+                    content: `System: ${content}`
+                });
+            } else {
+                let lastMsg = claudeMessages[claudeMessages.length - 1];
+                if (lastMsg.role === 'user') {
+                    lastMsg.content += `\n\nSystem: ${content}`;
+                } else {
+                    claudeMessages.push({
+                        role: 'user',
+                        content: `System: ${content}`
+                    });
+                }
+            }
+            continue;
+        }
+
+        if (role === lastRole) {
+            let lastMsg = claudeMessages[claudeMessages.length - 1];
+            lastMsg.content += `\n\n${role === 'user' ? 'Human' : 'Assistant'}: ${content}`;
+        } else {
+            claudeMessages.push({
+                role: role,
+                content: role === 'user' ? `Human: ${content}` : content
+            });
+        }
+
+        lastRole = role;
+    }
+
+    return {
+        anthropic_version: "vertex-2023-10-16",
+        messages: claudeMessages,
+        max_tokens: chatGPTPayload.max_tokens || 1024,
+        temperature: chatGPTPayload.temperature || 0.7,
+        top_p: chatGPTPayload.top_p || 1,
+        stream: chatGPTPayload.stream || false
+    };
+}
+
+function transformClaudeToChatGPT(claudeResponse, originalRequest) {
+    let assistantMessage = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let stopReason = 'stop';
+
+    if (claudeResponse.content && Array.isArray(claudeResponse.content)) {
+        assistantMessage = claudeResponse.content
+            .filter(item => item.type === 'text')
+            .map(item => item.text)
+            .join('\n');
+    }
+
+    if (claudeResponse.usage) {
+        inputTokens = claudeResponse.usage.input_tokens || 0;
+        outputTokens = claudeResponse.usage.output_tokens || 0;
+    }
+
+    stopReason = claudeResponse.stop_reason || 'stop';
+
+    return {
+        id: 'chatcmpl-' + Math.random().toString(36).substr(2, 9),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: 'gpt-3.5-turbo-0613',
+        choices: [
+            {
+                index: 0,
+                message: {
+                    role: 'assistant',
+                    content: assistantMessage
+                },
+                finish_reason: stopReason
+            }
+        ],
+        usage: {
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens
+        }
+    };
+}
+
+
 
 function createErrorResponse(status, errorType, message) {
     const errorObject = { type: "error", error: { type: errorType, message: message } };
